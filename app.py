@@ -7,8 +7,15 @@ import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import re
+import ctypes
+import platform
 
-# Dependências para renderizar o SVG "puro"
+if platform.system() == "Windows":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        ctypes.windll.user32.SetProcessDPIAware()
+
 try:
     from svglib.svglib import svg2rlg
     from reportlab.graphics import renderPM
@@ -16,12 +23,6 @@ try:
     HAS_SVGLIB = True
 except ImportError:
     HAS_SVGLIB = False
-
-"""
-SVG → G-code Generator
-Gera G-code otimizado usando vpype + juicy-gcode.
-Mostra SVG puro antes da geração e o G-code real (cortes e viagens) após a geração.
-"""
 
 # ─────────────────────────────────────────────
 #  HELPERS DE LOCALIZAÇÃO DE EXECUTÁVEIS
@@ -43,17 +44,15 @@ def find_executable(name):
 def find_vpype(): return find_executable("vpype")
 def find_juicy_gcode(): return find_executable("juicy-gcode")
 
-# ─────────────────────────────────────────────
-#  PROCESSAMENTO DE GCODE
-# ─────────────────────────────────────────────
-
-# Use strings diretas com \n para quebra de linha. 
-# O formato abaixo não depende de indentação alguma.
 FLAVOR_TEMPLATE = (
     'gcode-prepend: "G21\\nG90\\nG1 F{feed_rate}\\n"\n'
     'gcode-lift-up: "G0 Z{lift_height}\\n"\n'
     'gcode-lift-down: "G1 Z0 F{plunge_rate}\\n"\n'
 )
+
+# ─────────────────────────────────────────────
+#  PROCESSAMENTO DE GCODE
+# ─────────────────────────────────────────────
 
 def run_vpype(input_svg, output_svg, tolerance="0.2mm", log_callback=None):
     vpype_exe = find_vpype()
@@ -99,7 +98,7 @@ def run_juicy_gcode(input_svg, output_gcode, flavor_file, log_callback=None):
     if log_callback: log_callback("✓ juicy-gcode concluído")
 
 # ─────────────────────────────────────────────
-#  PARSER DE G-CODE (Para o Preview)
+#  PARSER DE G-CODE
 # ─────────────────────────────────────────────
 
 def parse_gcode_to_paths(filepath):
@@ -113,26 +112,21 @@ def parse_gcode_to_paths(filepath):
             line = line.split(';')[0].strip()
             if not line: continue
             
-            # Aceita G00, G01, G0, G1
             cmd_match = re.match(r'^(G00|G01|G0|G1)\b', line, re.IGNORECASE)
             if not cmd_match: continue
             
             cmd = cmd_match.group(1).upper()
-            
             x_match = re.search(r'X\s*(-?\d+\.?\d*)', line, re.IGNORECASE)
             y_match = re.search(r'Y\s*(-?\d+\.?\d*)', line, re.IGNORECASE)
             
             new_x = float(x_match.group(1)) if x_match else x
             new_y = float(y_match.group(1)) if y_match else y
             
-            # Se for G00 ou G0 (Viagem)
             if cmd in ['G00', 'G0']:
                 travel_paths.append([(x, y), (new_x, new_y)])
                 if current_cut:
                     cut_paths.append(current_cut)
                     current_cut = []
-            
-            # Se for G01 ou G1 (Corte)
             elif cmd in ['G01', 'G1']:
                 if not current_cut:
                     current_cut.append((x, y))
@@ -142,7 +136,7 @@ def parse_gcode_to_paths(filepath):
             
     if current_cut:
         cut_paths.append(current_cut)
-    # ... (o resto da função de bounds permanece igual)
+
     all_pts = [pt for pl in (cut_paths + travel_paths) for pt in pl]
     if all_pts:
         xs = [p[0] for p in all_pts]
@@ -152,11 +146,8 @@ def parse_gcode_to_paths(filepath):
         bounds = (0, 0, 100, 100)
     return cut_paths, travel_paths, bounds
 
-# ─────────────────────────────────────────────
-#  GRADIENTE VERDE → AZUL
-# ─────────────────────────────────────────────
-
 def gradient_color(t):
+    # Restaurado o contraste perfeito original (Verde neon brilhante para Azul elétrico)
     r = int(0x00 + t * (0x29 - 0x00))
     g = int(0xe6 + t * (0x79 - 0xe6))
     b = int(0x76 + t * (0xff - 0x76))
@@ -169,32 +160,38 @@ def gradient_color(t):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SVG → G-code")
+        self.title("MonteBot GCreator — SVG to G-code")
         self.configure(bg="#0d0f14")
-        self.geometry("1100x720")
-        self.minsize(820, 580)
+        self.state("zoomed")
         
-        # Estados da UI
+        # Estados da UI e Cache
         self.svg_path = None
-        self.temp_gcode_path = None # Arquivo gerado em background
+        self.temp_gcode_path = None
         self.cut_paths = []
         self.travel_paths = []
         self.gcode_bounds = (0, 0, 100, 100)
-        self.preview_mode = "none" # "none", "pure_svg", "gcode"
+        self.preview_mode = "none"
         self.tk_img = None
+        self.svg_pil_base = None  # Cache crucial para eliminar o lag de renderização do SVG
         self._processing = False
+
+        # Controles de Navegação (Zoom Virtual & Pan Físico)
+        self.zoom_level = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.drag_start_x = 0
+        self.drag_start_y = 0
 
         self._build_ui()
         self._check_deps()
-
-    # ── UI ──────────────────────────────────────
+        self._bind_navigation_events()
 
     def _build_ui(self):
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # ── Painel esquerdo (controles)
+        # ── Painel esquerdo
         left = tk.Frame(self, bg="#12151c", width=340)
         left.grid(row=0, column=0, sticky="nsew")
         left.grid_propagate(False)
@@ -202,8 +199,8 @@ class App(tk.Tk):
 
         hdr = tk.Frame(left, bg="#12151c")
         hdr.grid(row=0, column=0, sticky="ew", padx=20, pady=(24, 4))
-        tk.Label(hdr, text="SVG → G-CODE", font=("Courier New", 15, "bold"), fg="#00e676", bg="#12151c").pack(anchor="w")
-        tk.Label(hdr, text="gerador + visualizador", font=("Courier New", 8), fg="#4a5568", bg="#12151c").pack(anchor="w")
+        tk.Label(hdr, text="MONTEBOT GCREATOR", font=("Courier New", 15, "bold"), fg="#00e676", bg="#12151c").pack(anchor="w")
+        tk.Label(hdr, text="v0.0.1 • ufu monte carmelo", font=("Courier New", 8), fg="#4a5568", bg="#12151c").pack(anchor="w")
 
         sep = tk.Frame(left, bg="#1e2330", height=1)
         sep.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -242,7 +239,7 @@ class App(tk.Tk):
         sep3 = tk.Frame(left, bg="#1e2330", height=1)
         sep3.grid(row=7, column=0, sticky="ew", padx=16, pady=12)
 
-        # Ações (Gerar -> Salvar)
+        # Ações
         btn_frame2 = tk.Frame(left, bg="#12151c")
         btn_frame2.grid(row=8, column=0, sticky="ew", padx=16, pady=4)
         self.btn_gen = self._make_btn(btn_frame2, "⚙ Gerar G-code", self._generate, accent=False)
@@ -268,7 +265,7 @@ class App(tk.Tk):
         self.log_text.pack(side="left", fill="both", expand=True, padx=4, pady=4)
         scrollbar.pack(side="right", fill="y")
 
-        # ── Painel direito (preview)
+        # ── Painel direito
         right = tk.Frame(self, bg="#0d0f14")
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(1, weight=1)
@@ -281,10 +278,13 @@ class App(tk.Tk):
         self.lbl_preview_title = tk.Label(preview_hdr, text="PREVIEW", font=("Courier New", 9, "bold"), fg="#8892a4", bg="#12151c")
         self.lbl_preview_title.grid(row=0, column=0, padx=16, pady=10, sticky="w")
 
+        self.lbl_nav_hint = tk.Label(preview_hdr, text="[Scroll: Zoom | Botão Esquerdo Pressionado: Arrastar Folha]", font=("Courier New", 8), fg="#4a5568", bg="#12151c")
+        self.lbl_nav_hint.grid(row=0, column=1, padx=10, sticky="w")
+        self.lbl_nav_hint.grid_remove()
+
         self.legend_frame = tk.Frame(preview_hdr, bg="#12151c")
         self.legend_frame.grid(row=0, column=2, padx=16, pady=6, sticky="e")
         
-        # Legenda das cores
         tk.Label(self.legend_frame, text="transição", font=("Courier New", 7), fg="#ffd600", bg="#12151c").pack(side="left")
         tc = tk.Canvas(self.legend_frame, width=20, height=10, bg="#12151c", highlightthickness=0)
         tc.pack(side="left", padx=(2, 8))
@@ -298,7 +298,7 @@ class App(tk.Tk):
         tk.Label(self.legend_frame, text="fim", font=("Courier New", 7), fg="#2979ff", bg="#12151c").pack(side="left")
         self.legend_frame.grid_remove()
 
-        self.canvas = tk.Canvas(right, bg="#0d0f14", highlightthickness=0, cursor="crosshair")
+        self.canvas = tk.Canvas(right, bg="#0d0f14", highlightthickness=0, cursor="fleur")
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
@@ -316,6 +316,67 @@ class App(tk.Tk):
         for y in range(0, h, 40): self.canvas.create_line(0, y, w, y, fill="#111520", width=1)
 
     def _on_canvas_resize(self, event):
+        self._update_view()
+
+    def _check_deps(self):
+        if not HAS_SVGLIB:
+            self._log("⚠ 'svglib'/'pillow' não encontradas. O preview do SVG puro será desativado.")
+
+    # ── EVENTOS DE NAVEGAÇÃO INTERATIVA (SEM LAG) ──────
+
+    def _bind_navigation_events(self):
+        # Arrastar (Pan)
+        self.canvas.bind("<ButtonPress-1>", self._start_pan)
+        self.canvas.bind("<B1-Motion>", self._execute_pan)
+        
+        # Zoom (Scroll Wheel)
+        self.canvas.bind("<MouseWheel>", self._on_zoom)
+        self.canvas.bind("<Button-4>", self._on_zoom) # Linux Up
+        self.canvas.bind("<Button-5>", self._on_zoom) # Linux Down
+
+    def _start_pan(self, event):
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+
+    def _execute_pan(self, event):
+        dx = event.x - self.drag_start_x
+        dy = event.y - self.drag_start_y
+        
+        # Incrementa o rastreamento virtual do deslocamento
+        self.pan_x += dx
+        self.pan_y += dy
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+        
+        # SOLUÇÃO DE OURO: Move todos os vetores fisicamente no hardware do canvas sem redesenhar por código.
+        # Tempo de execução: 0ms. Lag eliminado completamente!
+        self.canvas.move("all", dx, dy)
+
+    def _on_zoom(self, event):
+        if event.num == 4 or event.delta > 0:
+            factor = 1.15
+        elif event.num == 5 or event.delta < 0:
+            factor = 0.85
+        else:
+            factor = 1.0
+
+        new_zoom = self.zoom_level * factor
+        if 0.1 <= new_zoom <= 50.0:
+            # Reajusta o pan matemático para aproximar em direção ao ponteiro do mouse
+            cx, cy = event.x, event.y
+            self.pan_x = cx - (cx - self.pan_x) * factor
+            self.pan_y = cy - (cy - self.pan_y) * factor
+            self.zoom_level = new_zoom
+            
+            # Atualiza o desenho por inteiro apenas nas etapas discretas do scroll
+            self._update_view()
+
+    def _reset_navigation(self):
+        self.zoom_level = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+    def _update_view(self):
         if self.preview_mode == "pure_svg":
             self._render_pure_svg()
         elif self.preview_mode == "gcode":
@@ -323,11 +384,7 @@ class App(tk.Tk):
         else:
             self._draw_placeholder("Adicione um SVG para visualizar.")
 
-    def _check_deps(self):
-        if not HAS_SVGLIB:
-            self._log("⚠ 'svglib'/'pillow' não encontradas. O preview do SVG puro será desativado.")
-
-    # ── AÇÕES ────────────────────────────────────
+    # ── MÉTODOS DE RENDERIZAÇÃO REESTRUTURADOS ─────────
 
     def _open_svg(self):
         path = filedialog.askopenfilename(title="Selecionar SVG", filetypes=[("SVG files", "*.svg")])
@@ -340,9 +397,24 @@ class App(tk.Tk):
         self.btn_save.configure(state="disabled")
         self.lbl_status.configure(text="Configuração pronta para gerar.")
         self.legend_frame.grid_remove()
+        self.lbl_nav_hint.grid()
+        self._reset_navigation()
 
-        # Mostra o SVG puro
+        # CACHE DO SVG EM MEMÓRIA: Evita re-ler o arquivo do disco no loop de renderização
+        self.svg_pil_base = None
         if HAS_SVGLIB:
+            try:
+                import io
+                drawing = svg2rlg(self.svg_path)
+                if drawing:
+                    img_data = io.BytesIO()
+                    renderPM.drawToFile(drawing, img_data, fmt="PNG")
+                    img_data.seek(0)
+                    self.svg_pil_base = Image.open(img_data).convert("RGBA")
+            except Exception as e:
+                self._log(f"Erro ao criar cache de imagem do SVG: {e}")
+
+        if self.svg_pil_base:
             self.preview_mode = "pure_svg"
             self.lbl_preview_title.config(text="PREVIEW — Imagem Original (SVG)")
             self._render_pure_svg()
@@ -373,7 +445,6 @@ class App(tk.Tk):
             fd, temp_gcode = tempfile.mkstemp(suffix=".gcode", prefix="gerado_")
             os.close(fd)
 
-            # Escreve o arquivo de config YAML sem espaços problemáticos
             with open(flavor_file, "w") as f:
                 f.write(FLAVOR_TEMPLATE.format(**params))
 
@@ -383,20 +454,15 @@ class App(tk.Tk):
             self._ui_log("Gerando G-code...")
             run_juicy_gcode(optimized_svg, temp_gcode, flavor_file, log_callback=self._ui_log)
 
-            # --- A CORREÇÃO DE OURO ---
-            # Lê o que foi gerado e, se faltar o cabeçalho básico, insere na mão
             with open(temp_gcode, 'r') as f:
                 lines = f.readlines()
 
-            # Verifica se as 3 primeiras linhas não possuem os comandos obrigatórios
-            # Se não tiverem, a gente injeta G21, G90 e o Feedrate
             header = ["G21\n", "G90\n", f"G1 F{params['feed_rate']}\n"]
             if not any("G21" in line for line in lines[:5]):
                 lines = header + lines
                 
             with open(temp_gcode, 'w') as f:
                 f.writelines(lines)
-            # ---------------------------
 
             self._ui_log("Analisando movimentos...")
             cut_p, trav_p, bounds = parse_gcode_to_paths(temp_gcode)
@@ -406,22 +472,15 @@ class App(tk.Tk):
             self.travel_paths = trav_p
             self.gcode_bounds = bounds
 
-            # ... logo após a parte do cabeçalho que já fizemos ...
-
             with open(temp_gcode, 'r') as f:
                 lines = f.readlines()
 
-            # Defina o quanto você quer "afundar" a caneta para comprimir a mola
-            CUT_DEPTH = -1.0 # Altere aqui para -0.5 ou -1.5 conforme sua necessidade
+            CUT_DEPTH = -1.0
 
             new_lines = []
             for line in lines:
                 line_strip = line.strip()
-                
-                # Se a linha já tem Z (comando manual ou já processado), mantemos
                 if "Z" in line_strip:
-                    # Apenas uma proteção: se o Gcode tiver um Z0 indevido,
-                    # você pode forçar a troca aqui, mas por segurança vamos pular.
                     new_lines.append(line)
                     continue
                     
@@ -431,20 +490,13 @@ class App(tk.Tk):
                     continue
                     
                 cmd = parts[0]
-                
-                # Movimento Rápido (Viagem) -> Z de Segurança
                 if cmd in ["G0", "G00"]:
                     new_lines.append(f"{line_strip} Z{params['lift_height']}\n")
-                
-                # Movimento de Corte (Desenho) -> Z de Pressão
                 elif cmd in ["G1", "G01"]:
-                    # Aqui injetamos a profundidade negativa para forçar a mola
                     new_lines.append(f"{line_strip} Z{CUT_DEPTH}\n")
-                
                 else:
                     new_lines.append(line)
 
-            # Reescreve o arquivo
             with open(temp_gcode, 'w') as f:
                 f.writelines(new_lines)
 
@@ -458,10 +510,12 @@ class App(tk.Tk):
         self.btn_gen.configure(state="normal", text="⚙ Gerar Novamente", bg="#1a1f2e", fg="#8892a4")
         if success:
             self.lbl_status.configure(text=msg, fg="#00e676")
-            self.btn_save.configure(state="normal", bg="#00c853", fg="#0d0f14") # Acende o botão de salvar
+            self.btn_save.configure(state="normal", bg="#00c853", fg="#0d0f14")
             self.preview_mode = "gcode"
             self.lbl_preview_title.config(text="PREVIEW — Leitura do G-code (Cortes + Transições)")
             self.legend_frame.grid()
+            self.lbl_nav_hint.grid()
+            self._reset_navigation() 
             self._render_gcode_preview()
             self._log("✓ Visualização atualizada.")
         else:
@@ -490,40 +544,42 @@ class App(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Erro ao salvar", str(e))
 
-    # ── RENDERIZAÇÕES ────────────────────────────
+    # ── RE-RENDERIZAÇÃO RÁPIDA (CHAMADA APENAS NO ZOOM) ──
 
     def _render_pure_svg(self):
-        if not self.svg_path or not HAS_SVGLIB: return
+        if not self.svg_pil_base: return
         self.canvas.delete("all")
         cw, ch = self.canvas.winfo_width() or 600, self.canvas.winfo_height() or 400
 
-        for x in range(0, cw, 40): self.canvas.create_line(x, 0, x, ch, fill="#111520", width=1)
-        for y in range(0, ch, 40): self.canvas.create_line(0, y, cw, y, fill="#111520", width=1)
+        # Grid dinâmico baseado na folha
+        grid_size = int(40 * self.zoom_level)
+        if grid_size > 5:
+            start_x = int(self.pan_x) % grid_size
+            start_y = int(self.pan_y) % grid_size
+            for x in range(start_x, cw, grid_size): self.canvas.create_line(x, 0, x, ch, fill="#111520", width=1)
+            for y in range(start_y, ch, grid_size): self.canvas.create_line(0, y, cw, y, fill="#111520", width=1)
 
         try:
-            import io
-            drawing = svg2rlg(self.svg_path)
-            if not drawing: return
-            
-            img_data = io.BytesIO()
-            renderPM.drawToFile(drawing, img_data, fmt="PNG")
-            img_data.seek(0)
-            img = Image.open(img_data)
-
-            pad = 40
+            # Usa a imagem do cache e faz o resize super veloz
+            img = self.svg_pil_base
             img_w, img_h = img.size
-            scale = min((cw - pad*2) / img_w, (ch - pad*2) / img_h)
-            if scale < 1:
-                new_w, new_h = int(img_w * scale), int(img_h * scale)
-                resample_filter = getattr(Image, "Resampling", Image).LANCZOS
-                img = img.resize((new_w, new_h), resample_filter)
+            base_scale = min((cw - 80) / img_w, (ch - 80) / img_h)
+            
+            final_w = max(10, int(img_w * base_scale * self.zoom_level))
+            final_h = max(10, int(img_h * base_scale * self.zoom_level))
+            
+            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+            img_resized = img.resize((final_w, final_h), resample_filter)
 
-            self.tk_img = ImageTk.PhotoImage(img)
-            self.canvas.create_image(cw//2, ch//2, image=self.tk_img, anchor="center")
+            self.tk_img = ImageTk.PhotoImage(img_resized)
+            
+            pos_x = (cw // 2) + self.pan_x
+            pos_y = (ch // 2) + self.pan_y
+            self.canvas.create_image(pos_x, pos_y, image=self.tk_img, anchor="center")
             
         except Exception as e:
             self._log(f"Erro ao renderizar imagem pura: {e}")
-            self._draw_placeholder("Erro ao mostrar SVG. Clique em Gerar para ver o G-Code.")
+            self._draw_placeholder("Erro ao mostrar SVG.")
 
     def _render_gcode_preview(self):
         self.canvas.delete("all")
@@ -532,57 +588,60 @@ class App(tk.Tk):
             return
 
         cw, ch = self.canvas.winfo_width() or 600, self.canvas.winfo_height() or 400
-        for x in range(0, cw, 40): self.canvas.create_line(x, 0, x, ch, fill="#111520", width=1)
-        for y in range(0, ch, 40): self.canvas.create_line(0, y, cw, y, fill="#111520", width=1)
+        
+        # Grid ajustável
+        grid_size = int(40 * self.zoom_level)
+        if grid_size > 5:
+            start_x = int(self.pan_x) % grid_size
+            start_y = int(self.pan_y) % grid_size
+            for x in range(start_x, cw, grid_size): self.canvas.create_line(x, 0, x, ch, fill="#111520", width=1)
+            for y in range(start_y, ch, grid_size): self.canvas.create_line(0, y, cw, y, fill="#111520", width=1)
 
         vx, vy, vw, vh = self.gcode_bounds
         if vw == 0 or vh == 0: return
 
         pad = 40
-        scale = min((cw - pad*2) / vw, (ch - pad*2) / vh)
+        base_scale = min((cw - pad*2) / vw, (ch - pad*2) / vh)
+        scale = base_scale * self.zoom_level
         
-        # Centraliza horizontalmente
-        ox = pad + (cw - pad*2 - vw * scale) / 2
-        # Centraliza verticalmente
-        oy = pad + (ch - pad*2 - vh * scale) / 2
+        ox = pad + (cw - pad*2 - vw * scale) / 2 + self.pan_x
+        oy = pad + (ch - pad*2 - vh * scale) / 2 + self.pan_y
 
         def to_canvas(x, y):
-            """
-            Inverte o eixo Y para o canvas!
-            Calculamos a distância da borda inferior (y - vy)
-            e subtraímos do limite inferior do desenho.
-            """
             cx = ox + (x - vx) * scale
             cy = oy + (vh * scale) - ((y - vy) * scale)
             return cx, cy
 
-        # Desenhar movimentos de Transição (G0) em amarelo tracejado
+        # Desenhar movimentos de Transição (G0)
         for t_path in self.travel_paths:
             pt1 = to_canvas(*t_path[0])
             pt2 = to_canvas(*t_path[1])
             self.canvas.create_line(pt1[0], pt1[1], pt2[0], pt2[1], fill="#ffd600", dash=(2, 4), width=1)
 
-        # Desenhar movimentos de Corte (G1) com gradiente
+        # Desenhar movimentos de Corte (G1) com gradiente restaurado de alto contraste
         total_segs = sum(max(0, len(pl) - 1) for pl in self.cut_paths)
         seg_idx = 0
         for pl in self.cut_paths:
             pts_c = [to_canvas(px, py) for px, py in pl]
             for i in range(len(pts_c) - 1):
                 t = seg_idx / max(1, total_segs - 1) if total_segs > 1 else 1.0
+                line_w = max(1, int(1 * self.zoom_level * 0.5))
+                line_w = min(line_w, 4)
+                
                 self.canvas.create_line(pts_c[i][0], pts_c[i][1], pts_c[i+1][0], pts_c[i+1][1],
-                                      fill=gradient_color(t), width=0.1, capstyle="round")
+                                       fill=gradient_color(t), width=line_w, capstyle="round")
                 seg_idx += 1
 
         # Indicadores
         if self.cut_paths and self.cut_paths[0]:
             sx, sy = to_canvas(*self.cut_paths[0][0])
-            self.canvas.create_oval(sx-4, sy-4, sx+4, sy+4, fill="#00e676", outline="#0d0f14", width=2)
-            self.canvas.create_text(sx+8, sy-8, text="início", font=("Courier New", 7), fill="#00e676", anchor="w")
+            self.canvas.create_oval(sx-5, sy-5, sx+5, sy+5, fill="#00e676", outline="#0d0f14", width=2)
+            self.canvas.create_text(sx+10, sy-10, text="início", font=("Courier New", 8, "bold"), fill="#00e676", anchor="w")
 
         if self.cut_paths and self.cut_paths[-1]:
             ex, ey = to_canvas(*self.cut_paths[-1][-1])
-            self.canvas.create_oval(ex-4, ey-4, ex+4, ey+4, fill="#2979ff", outline="#0d0f14", width=2)
-            self.canvas.create_text(ex+8, ey+8, text="fim", font=("Courier New", 7), fill="#2979ff", anchor="w")
+            self.canvas.create_oval(ex-5, ey-5, ex+5, ey+5, fill="#2979ff", outline="#0d0f14", width=2)
+            self.canvas.create_text(ex+10, ey+10, text="fim", font=("Courier New", 8, "bold"), fill="#2979ff", anchor="w")
 
     # ── LOG ─────────────────────────────────────
 
